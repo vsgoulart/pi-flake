@@ -1,0 +1,105 @@
+name: Update release
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: update-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      changed: ${{ steps.update.outputs.changed }}
+      version: ${{ steps.update.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/nix-installer-action@v20
+      - name: Update sources
+        id: update
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/update.sh
+          if git diff --quiet -- sources.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$(jq -r .version sources.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sources
+          path: sources.json
+
+  # Runs for every new pin, and on manual dispatch to re-verify the current one.
+  build:
+    needs: update
+    if: needs.update.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            system: x86_64-linux
+          - os: ubuntu-24.04-arm
+            system: aarch64-linux
+          - os: macos-15
+            system: aarch64-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: sources
+      - uses: DeterminateSystems/nix-installer-action@v20
+      - name: Verify runner system
+        run: test "$(nix eval --impure --raw --expr builtins.currentSystem)" = "${{ matrix.system }}"
+      - name: Build
+        run: nix build --print-build-logs .#pi --out-link pi
+      - name: Smoke test
+        env:
+          EXPECTED: ${{ needs.update.outputs.version }}
+          PI_OFFLINE: "1"
+          PI_TELEMETRY: "0"
+        run: |
+          export HOME="$(mktemp -d)"
+          actual="$(./pi/bin/pi --version)"
+          echo "$actual"
+          [[ "$actual" == *"$EXPECTED"* ]]
+          ./pi/bin/pi --help | grep -q 'AI coding assistant'
+          test -f pi/libexec/pi/theme/dark.json
+      - name: Verify macOS signature
+        if: runner.os == 'macOS'
+        run: codesign --verify --strict pi/libexec/pi/pi
+
+  commit:
+    needs: [update, build]
+    if: needs.update.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: sources
+      - name: Commit update
+        env:
+          VERSION: ${{ needs.update.outputs.version }}
+        run: |
+          git diff --quiet -- sources.json && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sources.json
+          git commit -m "chore: update pi to ${VERSION}"
+          git push
